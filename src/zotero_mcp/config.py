@@ -27,6 +27,23 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class MineruConfig:
+    """MinerU cloud parsing options.
+
+    ``vlm`` is the layout-aware model and the only one that reliably returns
+    LaTeX formulas; ``language`` is MinerU's OCR language code (``ch`` covers
+    Chinese and English papers).
+    """
+
+    model: str = "vlm"
+    language: str = "ch"
+    enable_formula: bool = True
+    enable_table: bool = True
+    api_base: str = "https://mineru.net/api/v4"
+    timeout_seconds: int = 1800
+
+
+@dataclass
 class ExtractionConfig:
     pdf_max_pages: int | None = None
     fulltext_display_max_pages: int | None = None
@@ -34,6 +51,10 @@ class ExtractionConfig:
     # than one readable file. None means the default (PDF > HTML > rest);
     # see zotero_mcp.extract.normalize_attachment_priority (#378).
     attachment_priority: list[str] | None = None
+    # PDF backend used by interactive reads/fulltext: "pdf-inspector" (local,
+    # fast) or "mineru" (cloud VLM, LaTeX formulas, slower).
+    pdf_engine: str = "pdf-inspector"
+    mineru: MineruConfig = field(default_factory=MineruConfig)
 
 
 @dataclass

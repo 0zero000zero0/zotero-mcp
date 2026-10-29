@@ -8,15 +8,16 @@ from contextlib import contextmanager
 from typing import Literal
 
 from fastmcp import Context
-from fastmcp.utilities.types import Image
 from fastmcp.exceptions import ToolError
+from fastmcp.utilities.types import Image
 
 from zotero_mcp import client as _client
 from zotero_mcp import library as _library
 from zotero_mcp import utils as _utils
 from zotero_mcp._app import mcp
 from zotero_mcp.config import load_config
-from zotero_mcp.extract import extract_pdf, pdf_page_count
+from zotero_mcp.extract import extract_pdf, pdf_page_count, resolve_pdf_engine
+from zotero_mcp.mineru import MineruError
 from zotero_mcp.tools import _helpers
 
 _TMPDIR_PREFIX = "zotero_pdf_"
@@ -205,7 +206,9 @@ _IMAGE_HINTS = {
     "flags pages whose equations, figures or tables the text garbles. "
     "format='image' returns the pages as PNG images (up to 10) so those can be read "
     "exactly; rect=[x, y, width, height] (normalized 0-1, e.g. from "
-    "zotero_get_page_layout) returns just that region of start_page, zoomed in.",
+    "zotero_get_page_layout) returns just that region of start_page, zoomed in. "
+    "engine='mineru' uses MinerU's cloud VLM for LaTeX formulas; the default "
+    "'pdf-inspector' is local and much faster.",
     # Text or a list of text and images, so no single structured schema fits.
     output_schema=None,
 )
@@ -215,6 +218,7 @@ def read_pdf_pages(
     end_page: int | None = None,
     format: Literal["text", "image"] = "text",
     rect: list[float] | str | None = None,
+    engine: Literal["pdf-inspector", "mineru"] | None = None,
     *,
     ctx: Context,
 ) -> str | list:
@@ -226,6 +230,7 @@ def read_pdf_pages(
         end_page: Last page to read (1-indexed). If omitted, reads only start_page.
         format: "text" for Markdown, "image" for PNG page images.
         rect: With format="image", crop start_page to [x, y, width, height].
+        engine: PDF backend override: "pdf-inspector" or "mineru".
         ctx: MCP context.
     """
     if format == "image":
@@ -233,7 +238,7 @@ def read_pdf_pages(
         return [header, *(Image(data=page["png"], format="png") for page in pages)]
     if format != "text":
         raise PdfReadError(f"format must be 'text' or 'image', got {format!r}", code="bad_format")
-    return read_pdf_text(item_key, start_page, end_page, ctx=ctx)
+    return read_pdf_text(item_key, start_page, end_page, ctx=ctx, engine=engine)
 
 
 @contextmanager
@@ -315,27 +320,40 @@ def read_pdf_text(
     *,
     ctx: Context,
     surface: Literal["mcp", "cli"] = "mcp",
+    engine: Literal["pdf-inspector", "mineru"] | None = None,
 ) -> str:
     """Markdown for a page range, with pages the text garbles flagged.
 
     ``surface`` picks whether the closing advice names the MCP tool's image
-    format or the zotero-cli flag.
+    format or the zotero-cli flag. ``engine`` selects the PDF backend; MinerU
+    output carries formulas as LaTeX, so its pages are not flagged as
+    garbled.
     """
+    engine = resolve_pdf_engine(engine)
     try:
         with _page_range(item_key, start_page, end_page,
                          max_pages=_TEXT_MAX_PAGES, ctx=ctx) as (pdf_path, title, total_pages,
                                                                  actual_end, clamped_note):
             try:
                 # extract_pdf takes 0-indexed pages; the tool's API is 1-indexed.
-                doc = extract_pdf(
-                    pdf_path, pages=list(range(start_page - 1, actual_end)), reuse=True,
-                )
+                kwargs = {
+                    "pages": list(range(start_page - 1, actual_end)),
+                    "reuse": True,
+                }
+                if engine != "pdf-inspector":
+                    kwargs["engine"] = engine
+                doc = extract_pdf(pdf_path, **kwargs)
+            except MineruError as exc:
+                raise PdfReadError(
+                    f"Could not read PDF for item {item_key}: {exc}",
+                    code=exc.code,
+                ) from exc
             except Exception as exc:
                 raise PdfReadError(
                     f"Could not read PDF for item {item_key}: {exc}",
                     code="pdf_unreadable",
                 ) from exc
-            flags = _garbled_content_flags(pdf_path, doc)
+            flags = {} if engine == "mineru" else _garbled_content_flags(pdf_path, doc)
 
         output = [
             f"# PDF Pages {start_page}-{actual_end} of {title}",
@@ -535,12 +553,14 @@ def find_in_pdf(
     *,
     context: int = 12,
     ctx: Context,
+    engine: Literal["pdf-inspector", "mineru"] | None = None,
 ) -> dict:
     """Locate ``query`` in an item's PDF (optionally within a page range).
 
     One extraction of the requested pages, then ``find_in_pages``. The result
     carries ``item_key``, ``title`` and ``total_pages`` for ``format_find``.
     """
+    engine = resolve_pdf_engine(engine)
     if not item_key or not item_key.strip():
         raise PdfReadError("Error: item_key cannot be empty.", code="empty_item_key")
     if start_page is not None and start_page < 1:
@@ -555,7 +575,11 @@ def find_in_pdf(
     try:
         try:
             if start_page is None and end_page is None:
-                doc = extract_pdf(pdf_path)
+                doc = (
+                    extract_pdf(pdf_path)
+                    if engine == "pdf-inspector"
+                    else extract_pdf(pdf_path, engine=engine)
+                )
             else:
                 total = pdf_page_count(pdf_path)
                 first = start_page or 1
@@ -563,7 +587,10 @@ def find_in_pdf(
                     raise PdfReadError(
                         f"Start page {first} is out of range. PDF has {total} pages (1-{total}).",
                         code="page_out_of_range")
-                doc = extract_pdf(pdf_path, pages=list(range(first - 1, min(end_page or total, total))))
+                kwargs = {"pages": list(range(first - 1, min(end_page or total, total)))}
+                if engine != "pdf-inspector":
+                    kwargs["engine"] = engine
+                doc = extract_pdf(pdf_path, **kwargs)
         except PdfReadError:
             raise
         except Exception as exc:

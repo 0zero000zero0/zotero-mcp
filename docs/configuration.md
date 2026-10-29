@@ -189,7 +189,15 @@ PDFs are parsed with [pdf-inspector](https://github.com/firecrawl/pdf-inspector)
     "extraction": {
       "pdf_max_pages": 50,
       "fulltext_display_max_pages": 10,
-      "attachment_priority": ["markdown", "pdf", "html", "other"]
+      "attachment_priority": ["markdown", "pdf", "html", "other"],
+      "pdf_engine": "pdf-inspector",
+      "mineru": {
+        "model": "vlm",
+        "language": "ch",
+        "enable_formula": true,
+        "enable_table": true,
+        "timeout_seconds": 1800
+      }
     }
   }
 }
@@ -200,6 +208,12 @@ PDFs are parsed with [pdf-inspector](https://github.com/firecrawl/pdf-inspector)
 | `pdf_max_pages` | `50` | Pages extracted per PDF when indexing. Raising it does not widen what search sees on its own — that is bounded by the embedding model's token limit or `chunking.max_chunks_per_item`. |
 | `fulltext_display_max_pages` | `10` | Pages returned by `zotero_get_item_fulltext`. Separate from the above because reading a paper is bounded by your assistant's context, not by recall. |
 | `attachment_priority` | `["pdf", "html", "other"]` | Order in which attachment kinds are tried when an item has several readable files. |
+| `pdf_engine` | `"pdf-inspector"` | Backend for interactive reads: `pdf-inspector` (local, fast) or `mineru` (cloud VLM, LaTeX formulas). Indexing still uses pdf-inspector. |
+| `mineru.model` | `"vlm"` | MinerU model version. `vlm` is the layout-aware one. |
+| `mineru.language` | `"ch"` | MinerU OCR language (`ch` covers Chinese and English). |
+| `mineru.enable_formula` | `true` | Emit display and inline formulas as LaTeX. |
+| `mineru.enable_table` | `true` | Emit tables as HTML. |
+| `mineru.timeout_seconds` | `1800` | How long to wait for one MinerU job. |
 
 **`attachment_priority`** exists for the case where you have converted a paper to clean Markdown yourself and attached it next to the original PDF. By default the PDF still wins; listing `"markdown"` first makes your converted copy the one that gets read and indexed. Valid entries are `pdf`, `html`, `markdown`, `text` and `other`. `other` is a catch-all matching every kind not named elsewhere in the list, so the default sweeps Markdown and plain text into one bucket where the larger file wins. Omitting `other` means anything unlisted is never chosen.
 
@@ -208,6 +222,25 @@ Changing this setting marks affected items for re-extraction, so a following `zo
 To read one specific attachment regardless of priority, pass that attachment's own key to `zotero_get_item_fulltext` (find it with `zotero_get_item_children`) — an attachment key bypasses the priority order and reads exactly that file.
 
 Extracted text is reliable for prose and unreliable for math and tables. `zotero_read_pdf_pages` flags the pages where that happens and can return those pages as images (`format='image'`).
+
+### MinerU backend (LaTeX formulas)
+
+MinerU is an optional cloud parser for papers whose equations matter. It reads double-column layouts in order and returns formulas as LaTeX (`$$ ... \tag{3}$$`), tables as HTML, and figure captions as separate blocks. Enable it per call:
+
+```bash
+zotero-cli get fulltext ITEM_KEY --engine mineru
+zotero-cli read ITEM_KEY --start-page 3 --end-page 4 --engine mineru
+```
+
+or make it the default for interactive reads:
+
+```json
+{"semantic_search": {"extraction": {"pdf_engine": "mineru"}}}
+```
+
+The API key comes from `MINERU_API_KEY`, or from `mineru_api_key=...` in `~/.shell-env.sh` (the shell file this project's tooling already reads). Get a key at <https://mineru.net/apiManage>. MinerU's free tier allows about 1,000 pages per day and the API accepts at most 200 pages per file. Parsed results are cached under `~/.cache/zotero-mcp/mineru`, keyed by file content and options, so re-reading a page range does not upload the paper again.
+
+`pdf_engine` affects `zotero_get_item_fulltext`, `zotero_read_pdf_pages` and their CLI equivalents. Bulk indexing (`update-db`) always uses pdf-inspector: sending a whole library through MinerU would burn the daily quota and take hours. The first MinerU call uploads the PDF, so allow roughly 10–60 seconds depending on file size and queue.
 
 ## Passage chunking
 

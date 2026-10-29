@@ -31,6 +31,7 @@ from .extract import (
     categorize_attachment,
     extract_file,
     normalize_attachment_priority,
+    normalize_pdf_engine,
     pick_by_priority,
 )
 from .utils import _generate_search_variants, _normalize_for_search, is_local_mode
@@ -1057,6 +1058,7 @@ class LocalZoteroReader:
     extraction_workers: int = 1
     fulltext_cache_enabled: bool = False
     reuse_pdf_parse: bool = False
+    pdf_engine: str = "pdf-inspector"
     config_path: str | None = None
     _library_labels: dict[int, tuple[int, str]] | None = None
     _field_names: frozenset[str] | None = None
@@ -1070,6 +1072,7 @@ class LocalZoteroReader:
         fulltext_cache_enabled: bool = False,
         config_path: str | None = None,
         reuse_pdf_parse: bool = False,
+        pdf_engine: str = "pdf-inspector",
     ):
         """
         Initialize the local database reader.
@@ -1096,6 +1099,8 @@ class LocalZoteroReader:
             reuse_pdf_parse: Serve repeat reads of an unchanged PDF from the
                 in-process parse memo (``extract_pdf(reuse=True)``). For
                 interactive tools; indexing leaves it off.
+            pdf_engine: PDF backend: ``"pdf-inspector"`` (local default) or
+                ``"mineru"`` (cloud VLM with LaTeX formulas).
         """
         self.db_path = db_path or self._find_zotero_db()
         self._connection: sqlite3.Connection | None = None
@@ -1112,6 +1117,7 @@ class LocalZoteroReader:
         self.fulltext_cache_enabled: bool = fulltext_cache_enabled
         self.config_path: str | None = config_path
         self.reuse_pdf_parse: bool = reuse_pdf_parse
+        self.pdf_engine: str = normalize_pdf_engine(pdf_engine)
 
     def _find_zotero_db(self) -> str:
         """
@@ -1364,6 +1370,7 @@ class LocalZoteroReader:
             file_path,
             max_pages=self._resolve_pdf_max_pages(),
             reuse=self.reuse_pdf_parse,
+            engine=self.pdf_engine,
         )
 
     def _get_fulltext_meta_for_item(self, item_id: int):
@@ -1476,11 +1483,12 @@ class LocalZoteroReader:
     def _cache_profile(self) -> str:
         """Extraction settings that change the text produced for one file.
 
-        Only the page cap qualifies. ``attachment_priority`` does not: the
-        cache is keyed by *attachment*, so changing the priority resolves to
-        a different attachment and misses on its own.
+        The page cap and PDF engine qualify; both change the text produced
+        for the same file. ``attachment_priority`` does not: the cache is
+        keyed by *attachment*, so changing the priority resolves to a
+        different attachment and misses on its own.
         """
-        return f"maxpages={self._resolve_pdf_max_pages()}"
+        return f"maxpages={self._resolve_pdf_max_pages()};engine={self.pdf_engine}"
 
     def _cache_lookup(self, target: Path, attachment_key: str) -> tuple[str, str] | None:
         """Transient-cache hit for an unchanged attachment, or None."""

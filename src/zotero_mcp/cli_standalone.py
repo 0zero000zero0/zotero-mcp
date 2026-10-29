@@ -327,7 +327,12 @@ def cmd_get(args):
             return
         print(result)
     elif sub == "fulltext":
-        result = retrieval.get_item_fulltext(item_key=args.item_key, ctx=ctx)
+        from zotero_mcp.extract import resolve_pdf_engine
+
+        engine = resolve_pdf_engine(getattr(args, "engine", None))
+        result = retrieval.get_item_fulltext(
+            item_key=args.item_key, ctx=ctx, engine=engine,
+        )
         # A failure leads with "Error"; a success leads with the item's
         # metadata heading ("# Error-correcting codes" is a fine title). Only
         # structured data skips _out's failure check, so a failure must not
@@ -335,7 +340,10 @@ def cmd_get(args):
         failed = result.startswith("Error")
         data = None
         if json_mode and not failed:
-            data = {"item_key": args.item_key, "text": result, "chars": len(result)}
+            data = {
+                "item_key": args.item_key, "text": result, "chars": len(result),
+                "engine": engine,
+            }
             # The TRUNCATED heading is prose; scripts reading data.chars need it as fields.
             m = re.search(r"\(pages 1-(\d+) of (\d+) — TRUNCATED\)", result)
             data["truncated"] = bool(m)
@@ -1165,10 +1173,16 @@ def cmd_read(args):
     setup_zotero_environment()
     from zotero_mcp.tools import read_pdf as read_pdf_mod
 
+    engine = getattr(args, "engine", None)
     if find is not None:
+        kwargs = {
+            "context": getattr(args, "context", 12),
+            "ctx": _ctx(args),
+        }
+        if engine:
+            kwargs["engine"] = engine
         result = read_pdf_mod.find_in_pdf(
-            args.item_key, find, args.start_page, args.end_page,
-            context=getattr(args, "context", 12), ctx=_ctx(args),
+            args.item_key, find, args.start_page, args.end_page, **kwargs,
         )
         _out(args, "read", data=result if _json_mode(args) else None,
              text=read_pdf_mod.format_find(result))
@@ -1199,8 +1213,11 @@ def cmd_read(args):
                 print(f"p{image['page']}: {image['path']} ({image['width']}x{image['height']})")
         return
 
+    kwargs = {"ctx": _ctx(args), "surface": "cli"}
+    if engine:
+        kwargs["engine"] = engine
     text = read_pdf_mod.read_pdf_text(
-        args.item_key, args.start_page, args.end_page, ctx=_ctx(args), surface="cli",
+        args.item_key, args.start_page, args.end_page, **kwargs,
     )
     _out(args, "read",
          data={"item_key": args.item_key, "start_page": args.start_page,
@@ -1514,6 +1531,8 @@ def build_parser() -> argparse.ArgumentParser:
     gm.add_argument("--output-format", choices=["markdown", "bibtex"], default="markdown")
     gf = g_sub.add_parser("fulltext", help="Get full text of an item")
     gf.add_argument("item_key")
+    gf.add_argument("--engine", choices=["pdf-inspector", "mineru"],
+                    help="PDF backend (default: semantic_search.extraction.pdf_engine)")
     gb = g_sub.add_parser("bibtex", help="Get BibTeX for an item")
     gb.add_argument("item_key")
     gc = g_sub.add_parser("collections", help="List all collections")
@@ -1791,6 +1810,9 @@ def build_parser() -> argparse.ArgumentParser:
                       help="image writes PNG page images (up to 10 pages) for math, figures and tables")
     rd_p.add_argument("--rect", help="With --format image: crop the start page to x,y,width,height "
                                      "(normalized 0-1), e.g. from `zotero-cli layout`")
+    rd_p.add_argument("--engine", choices=["pdf-inspector", "mineru"],
+                      help="PDF backend for text reads (default: config pdf_engine); "
+                           "'mineru' returns LaTeX formulas")
     rd_p.add_argument("--out", help="With --format image: directory for the PNG files "
                                     "(default: a new temporary directory)")
 

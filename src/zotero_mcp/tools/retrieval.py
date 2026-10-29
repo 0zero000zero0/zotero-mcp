@@ -17,7 +17,8 @@ from zotero_mcp._app import mcp
 from zotero_mcp._context import Context
 from zotero_mcp.client import with_zotero_api_lock
 from zotero_mcp.config import load_config
-from zotero_mcp.extract import extract_file
+from zotero_mcp.extract import extract_file, resolve_pdf_engine
+from zotero_mcp.mineru import MineruError
 from zotero_mcp.tools import _helpers
 
 #: Pages of a PDF to surface when an agent reads a paper inline, if nothing
@@ -171,6 +172,9 @@ def get_item_metadata(
         "Zotero's server-side fulltext index; direct download and parsing "
         "as a last resort. Image-only scanned PDFs without OCR "
         "may return little or no text. "
+        "engine: 'pdf-inspector' (default, local and fast) or 'mineru' "
+        "(cloud VLM that returns LaTeX formulas; slower and uses MinerU's "
+        "page quota). Use 'mineru' when equations matter. "
         "Example: zotero_get_item_fulltext(item_key='RTKZQI8E')."
     )
 )
@@ -178,7 +182,8 @@ def get_item_metadata(
 def get_item_fulltext(
     item_key: str,
     *,
-    ctx: Context
+    ctx: Context,
+    engine: Literal["pdf-inspector", "mineru"] | None = None,
 ) -> str:
     """
     Get the full text content of a Zotero item.
@@ -191,12 +196,15 @@ def get_item_fulltext(
             ``zotero_get_item_children`` to read one specific attachment of
             an item that has several (#378).
         ctx: MCP context
+        engine: PDF backend override: ``"pdf-inspector"`` or ``"mineru"``.
+            None uses ``semantic_search.extraction.pdf_engine`` from config.
 
     Returns:
         Markdown-formatted item full text
     """
     try:
         ctx.info(f"Fetching full text for item {item_key}")
+        engine = resolve_pdf_engine(engine)
         backend = _library.get_library_backend()
 
         # First get the item metadata
@@ -232,6 +240,7 @@ def get_item_fulltext(
                     pdf_max_pages=max_pages,
                     attachment_priority=config.semantic_search.extraction.attachment_priority,
                     reuse_pdf_parse=True,
+                    pdf_engine=engine,
                 ) as reader:
                     local_item = reader.get_item_by_key(item_key)
                     if local_item:
@@ -248,6 +257,10 @@ def get_item_fulltext(
                                 f"{metadata}\n\n---\n\n{body}",
                                 "Consider using zotero_semantic_search to find specific content instead of reading full papers."
                             )
+        except MineruError as mineru_error:
+            # A missing key or exhausted quota is a configuration problem,
+            # not a reason to silently serve pdf-inspector text instead.
+            return _fulltext_error(metadata, f"MinerU extraction failed: {mineru_error}")
         except Exception as local_extract_error:
             local_extract_error_msg = str(local_extract_error)
             ctx.info(f"Local extraction fallback not available: {str(local_extract_error)}")
@@ -262,17 +275,20 @@ def get_item_fulltext(
 
         ctx.info(f"Found attachment: {attachment.key} ({attachment.content_type})")
 
-        # Try fetching full text from Zotero's full text index first
-        try:
-            full_text_data = zot.fulltext_item(attachment.key)
-            if full_text_data and "content" in full_text_data and full_text_data["content"]:
-                ctx.info("Successfully retrieved full text from Zotero's index")
-                return _helpers._prepend_size_warning(
-                    f"{metadata}\n\n---\n\n## Full Text\n\n{full_text_data['content']}",
-                    "Consider using zotero_semantic_search to find specific content instead of reading full papers."
-                )
-        except Exception as fulltext_error:
-            ctx.info(f"Couldn't retrieve indexed full text: {str(fulltext_error)}")
+        # Try fetching full text from Zotero's full text index first. Skip it
+        # when MinerU was requested: the index was produced by Zotero's own
+        # parser, so serving it would quietly undo the engine choice.
+        if engine == "pdf-inspector":
+            try:
+                full_text_data = zot.fulltext_item(attachment.key)
+                if full_text_data and "content" in full_text_data and full_text_data["content"]:
+                    ctx.info("Successfully retrieved full text from Zotero's index")
+                    return _helpers._prepend_size_warning(
+                        f"{metadata}\n\n---\n\n## Full Text\n\n{full_text_data['content']}",
+                        "Consider using zotero_semantic_search to find specific content instead of reading full papers."
+                    )
+            except Exception as fulltext_error:
+                ctx.info(f"Couldn't retrieve indexed full text: {str(fulltext_error)}")
 
         # If we couldn't get indexed full text, try to download and convert the file
         try:
@@ -293,7 +309,7 @@ def get_item_fulltext(
                     # extract_file rather than convert_to_markdown: this path
                     # applies the same page cap, so it needs the document's
                     # page bookkeeping and not only its text (#448).
-                    doc = extract_file(download.path, max_pages=max_pages)
+                    doc = extract_file(download.path, max_pages=max_pages, engine=engine)
                     if doc is None:
                         return _fulltext_error(
                             metadata,

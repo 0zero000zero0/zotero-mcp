@@ -6,12 +6,17 @@ semantic indexer, and ``zotero_read_pdf_pages``. Keeping one seam means
 page provenance, OCR routing and engine choice are decided once instead of
 drifting across three call sites.
 
-PDFs are parsed by `pdf-inspector <https://github.com/firecrawl/pdf-inspector>`_,
-a Rust parser with prebuilt wheels and no Python dependencies. It runs
-in-process in roughly a tenth of a second for a journal article, emits
-Markdown with real heading structure, and reports which pages carry no text
-layer (:attr:`ExtractedDoc.needs_ocr`) — the routing signal an OCR backend
-will consume later.
+PDFs are parsed by `pdf-inspector <https://github.com/firecrawl/pdf-inspector>`_
+by default: a Rust parser with prebuilt wheels and no Python dependencies.
+It runs in-process in roughly a tenth of a second for a journal article,
+emits Markdown with real heading structure, and reports which pages carry no
+text layer (:attr:`ExtractedDoc.needs_ocr`) — the routing signal an OCR
+backend will consume later.
+
+Papers whose formulas matter can opt into the MinerU backend instead
+(``engine="mineru"``): it is a cloud VLM that returns LaTeX equations and
+HTML tables, at the cost of an upload and a network round trip. See
+:mod:`zotero_mcp.mineru`.
 
 ``ExtractedDoc.text`` joins pages with :data:`PAGE_SEPARATOR` so that
 character offsets can always be mapped back to a page number. Do not
@@ -66,6 +71,41 @@ ATTACHMENT_CATEGORIES = ("pdf", "html", "markdown", "text", "other")
 #: behaviour exactly, because ``"other"`` sweeps up markdown and plain text
 #: together and the larger file wins.
 DEFAULT_ATTACHMENT_PRIORITY = ("pdf", "html", "other")
+
+#: PDF backends understood by :func:`extract_pdf`. ``pdf-inspector`` is the
+#: in-process default; ``mineru`` uploads to MinerU's cloud VLM and returns
+#: LaTeX formulas.
+PDF_ENGINES = ("pdf-inspector", "mineru")
+
+
+def normalize_pdf_engine(engine: str | None) -> str:
+    """Return the canonical name for a PDF engine, raising on unknown names."""
+
+    value = (engine or "pdf-inspector").strip().lower()
+    aliases = {
+        "pdf": "pdf-inspector",
+        "inspector": "pdf-inspector",
+        "pdfinspector": "pdf-inspector",
+        "mineru-vlm": "mineru",
+    }
+    value = aliases.get(value, value)
+    if value not in PDF_ENGINES:
+        raise ValueError(
+            f"Unknown PDF engine {engine!r}; choose one of {', '.join(PDF_ENGINES)}"
+        )
+    return value
+
+
+def resolve_pdf_engine(engine: str | None = None) -> str:
+    """Resolve an explicit engine, falling back to the configured one."""
+
+    if engine is not None:
+        return normalize_pdf_engine(engine)
+    from .config import load_config
+
+    return normalize_pdf_engine(
+        load_config().semantic_search.extraction.pdf_engine
+    )
 
 
 @dataclass(frozen=True)
@@ -130,7 +170,7 @@ _MEMO_MAX_ENTRIES = 3
 _MEMO_MAX_CHARS = 8_000_000
 
 _ParseKey = tuple[str, int, int]
-_parse_memo: "OrderedDict[_ParseKey, ExtractedDoc]" = OrderedDict()
+_parse_memo: OrderedDict[_ParseKey, ExtractedDoc] = OrderedDict()
 _memo_lock = threading.Lock()
 _parse_lock = threading.Lock()
 
@@ -234,6 +274,7 @@ def extract_pdf(
     pages: list[int] | None = None,
     max_pages: int | None = None,
     reuse: bool = False,
+    engine: str = "pdf-inspector",
 ) -> ExtractedDoc:
     """Extract Markdown from a PDF.
 
@@ -249,14 +290,23 @@ def extract_pdf(
             memo. For interactive reads that revisit a file (page-range
             reads, ``zotero_get_item_fulltext``); leave it off for bulk
             indexing, which reads each file once and relies on the cap to
-            skip pages.
+            skip pages. Ignored by the ``mineru`` engine, which caches
+            parsed results on disk instead.
+        engine: ``"pdf-inspector"`` (default) or ``"mineru"``.
 
     Raises:
         ImportError: pdf-inspector is not installed.
         ValueError: the file is missing, empty, or not a PDF.
+        MineruError: the MinerU backend failed or is not configured.
     """
     if pages is not None and max_pages is not None:
         raise TypeError("pass either pages or max_pages, not both")
+
+    engine = normalize_pdf_engine(engine)
+    if engine == "mineru":
+        return _extract_pdf_with_mineru(
+            file_path, pages=pages, max_pages=max_pages,
+        )
 
     if reuse and (pages is not None or max_pages is not None):
         reused = _extract_pdf_reused(str(file_path), pages, max_pages)
@@ -329,6 +379,72 @@ def extract_pdf(
         # requested, so they remain comparable to ``page_numbers``.
         page_numbers=tuple(page.page for page in result.pages),
         needs_ocr=tuple(page.page for page in result.pages if page.needs_ocr),
+        truncated=truncated,
+    )
+
+
+def _extract_pdf_with_mineru(
+    file_path: str | Path,
+    *,
+    pages: list[int] | None,
+    max_pages: int | None,
+) -> ExtractedDoc:
+    """Run the MinerU backend and map its output back to source pages."""
+
+    from . import mineru
+    from .config import load_config
+
+    path = str(file_path)
+    total = pdf_page_count(path)
+    truncated = False
+    if pages is not None:
+        wanted = [p for p in pages if 0 <= p < total]
+        if not wanted:
+            return _doc_from_pages([], page_count=total, source="pdf")
+    elif max_pages is not None and max_pages > 0:
+        wanted = list(range(min(max_pages, total)))
+        truncated = len(wanted) < total
+    else:
+        wanted = list(range(total))
+
+    if len(wanted) > mineru.MAX_PAGES_PER_FILE:
+        raise mineru.MineruError(
+            f"MinerU accepts at most {mineru.MAX_PAGES_PER_FILE} pages per file; "
+            f"this request covers {len(wanted)}. Use a page range or a lower "
+            "pdf_max_pages.",
+            code="mineru_page_limit",
+        )
+
+    page_ranges = None
+    if wanted != list(range(total)):
+        page_ranges = mineru.format_page_ranges(wanted)
+
+    settings = load_config().semantic_search.extraction.mineru
+    result = mineru.extract_pdf(
+        path,
+        page_ranges=page_ranges,
+        model=settings.model,
+        language=settings.language,
+        enable_formula=settings.enable_formula,
+        enable_table=settings.enable_table,
+        api_base=settings.api_base,
+        timeout=float(settings.timeout_seconds),
+    )
+
+    # MinerU reports page_idx relative to the parsed range when a page range
+    # was used, but absolute when the whole document was parsed. If its page
+    # numbers fall outside the requested set, treat them as range-relative.
+    by_page = {page.page: page.markdown for page in result.pages}
+    if result.pages and all(page.page in wanted for page in result.pages):
+        page_text = [by_page.get(page, "") for page in wanted]
+    else:
+        page_text = [by_page.get(index, "") for index in range(len(wanted))]
+
+    return _doc_from_pages(
+        page_text,
+        page_count=total,
+        source="pdf",
+        page_numbers=tuple(wanted),
         truncated=truncated,
     )
 
@@ -645,22 +761,28 @@ def extract_file(
     *,
     max_pages: int | None = None,
     reuse: bool = False,
+    engine: str = "pdf-inspector",
 ) -> ExtractedDoc | None:
     """Extract text from an attachment, dispatching on extension.
 
     The tolerant entry point: unlike the per-format functions it logs and
     returns ``None`` instead of raising, because its callers are walking a
     library where any single unreadable attachment should be skipped rather
-    than abort the batch.
+    than abort the batch. MinerU failures are the exception: a missing key or
+    exhausted quota must reach the user instead of looking like an empty PDF.
     """
+    from .mineru import MineruError
+
     path = Path(file_path)
     suffix = path.suffix.lower()
     try:
         if suffix == ".pdf":
-            return extract_pdf(path, max_pages=max_pages, reuse=reuse)
+            return extract_pdf(path, max_pages=max_pages, reuse=reuse, engine=engine)
         if suffix in _HTML_SUFFIXES:
             return extract_html(path)
         return extract_text_file(path)
+    except MineruError:
+        raise
     except Exception as exc:
         logger.warning("Extraction failed for %s: %s", path.name, exc)
         return None

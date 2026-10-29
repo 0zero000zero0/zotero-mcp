@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **MinerU PDF backend for LaTeX formulas.** `zotero-cli get fulltext ITEM --engine mineru` and `zotero-cli read ITEM --start-page 3 --engine mineru` upload the PDF to MinerU's `vlm` model and return Markdown with formulas as LaTeX (`$$ ... \tag{3}$$`), tables as HTML and figures as captioned blocks. The API key is read from `MINERU_API_KEY` or `mineru_api_key` in `~/.shell-env.sh`; parsed output is cached under `~/.cache/zotero-mcp/mineru`. `semantic_search.extraction.pdf_engine` makes it the default for interactive reads; bulk indexing stays on pdf-inspector.
+
 ## [0.15.1] - 2026-10-16
 
 ### Added

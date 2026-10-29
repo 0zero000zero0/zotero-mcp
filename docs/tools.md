@@ -83,9 +83,9 @@ Example (Claude Desktop / Claude Code):
 
 ### 📚 Content tools
 - `zotero_get_item_metadata`: Get detailed metadata (supports `format="markdown"`, `format="json"` for complete raw Zotero metadata, and `format="bibtex"`)
-- `zotero_get_item_fulltext`: Get full text content
+- `zotero_get_item_fulltext`: Get full text content (`engine="mineru"` for LaTeX formulas)
 - `zotero_get_item_children`: Get attachments and notes for one item or many (pass an array of keys)
-- `zotero_read_pdf_pages`: Read a page range of a PDF as Markdown, with pages whose math, figures or tables the text garbles flagged; `format="image"` returns the pages as images, and `rect=[x, y, width, height]` zooms into one region
+- `zotero_read_pdf_pages`: Read a page range of a PDF as Markdown, with pages whose math, figures or tables the text garbles flagged; `format="image"` returns the pages as images, and `rect=[x, y, width, height]` zooms into one region. `engine="mineru"` returns formulas as LaTeX instead of flagging the page as garbled.
 - `zotero_get_pdf_outline`: Extract the table of contents / outline from a PDF attachment
 
 ### 📝 Annotation & notes tools
